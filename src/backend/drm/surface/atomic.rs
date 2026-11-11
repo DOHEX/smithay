@@ -1171,16 +1171,35 @@ impl AtomicDrmSurface {
         let removed = current_conns.difference(&pending_conns);
         let prop_mapping = self.prop_mapping.read().unwrap();
 
-        let req = AtomicRequest::build_request(
-            &prop_mapping,
-            self.crtc,
-            Some(pending.blob),
-            pending.vrr,
-            Some(&pending.resolved_color),
-            &pending_conns,
-            removed,
-            &*planes,
-        )?;
+        // An async page flip may not change any property besides the plane framebuffer, and the
+        // kernel compares blob properties by id. Our mode blob can differ from the one the kernel
+        // holds without the mode itself differing (we never commit it when the CRTC already had
+        // that mode, for example after a compositor restart or a session resume), which makes
+        // every async test fail on MODE_ID. So test exactly what `page_flip` will send: no mode
+        // blob and no connector state.
+        let req = if async_commit {
+            AtomicRequest::build_request(
+                &prop_mapping,
+                self.crtc,
+                None,
+                current.vrr,
+                None,
+                [],
+                [],
+                &*planes,
+            )?
+        } else {
+            AtomicRequest::build_request(
+                &prop_mapping,
+                self.crtc,
+                Some(pending.blob),
+                pending.vrr,
+                Some(&pending.resolved_color),
+                &pending_conns,
+                removed,
+                &*planes,
+            )?
+        };
 
         let mut flags = AtomicCommitFlags::TEST_ONLY;
         if allow_modeset {
