@@ -121,24 +121,45 @@ impl Device {
         unsafe { self.raw.get_semaphore_counter_value(self.timeline) }.unwrap_or(u64::MAX)
     }
 
-    unsafe fn destroy_item(&self, item: CleanupItem) {
+    unsafe fn destroy_item(&self, item: CleanupItem) -> Option<vk::DescriptorPool> {
         unsafe {
             match item {
-                CleanupItem::Image(image) => self.raw.destroy_image(image, None),
-                CleanupItem::ImageView(view) => self.raw.destroy_image_view(view, None),
-                CleanupItem::Memory(memory) => self.raw.free_memory(memory, None),
-                CleanupItem::Buffer(buffer) => self.raw.destroy_buffer(buffer, None),
-                CleanupItem::Semaphore(semaphore) => self.raw.destroy_semaphore(semaphore, None),
-                CleanupItem::DescriptorSet(pool, set) => {
-                    let _ = self.raw.free_descriptor_sets(pool, &[set]);
+                CleanupItem::Image(image) => {
+                    self.raw.destroy_image(image, None);
+                    None
                 }
-                CleanupItem::ShaderModule(module) => self.raw.destroy_shader_module(module, None),
+                CleanupItem::ImageView(view) => {
+                    self.raw.destroy_image_view(view, None);
+                    None
+                }
+                CleanupItem::Memory(memory) => {
+                    self.raw.free_memory(memory, None);
+                    None
+                }
+                CleanupItem::Buffer(buffer) => {
+                    self.raw.destroy_buffer(buffer, None);
+                    None
+                }
+                CleanupItem::Semaphore(semaphore) => {
+                    self.raw.destroy_semaphore(semaphore, None);
+                    None
+                }
+                CleanupItem::DescriptorSet(pool, set) => {
+                    self.raw.free_descriptor_sets(pool, &[set]).ok().map(|()| pool)
+                }
+                CleanupItem::ShaderModule(module) => {
+                    self.raw.destroy_shader_module(module, None);
+                    None
+                }
             }
         }
     }
 
     /// Destroys all queued resources whose timeline point completed.
-    fn process_cleanup(&self, up_to: u64) {
+    ///
+    /// Returns the descriptor pools from which descriptor sets were freed so the
+    /// renderer can replenish their available counts.
+    fn process_cleanup(&self, up_to: u64) -> Vec<vk::DescriptorPool> {
         let items = {
             let mut guard = self.cleanup.lock().unwrap();
             let mut items = Vec::new();
@@ -153,9 +174,13 @@ impl Device {
             });
             items
         };
+        let mut freed_pools = Vec::new();
         for item in items {
-            unsafe { self.destroy_item(item) };
+            if let Some(pool) = unsafe { self.destroy_item(item) } {
+                freed_pools.push(pool);
+            }
         }
+        freed_pools
     }
 
     /// Finds a memory type index in `type_bits` with the given property flags.
@@ -809,7 +834,29 @@ impl VulkanRenderer {
                 i += 1;
             }
         }
-        self.device.process_cleanup(completed);
+        for freed_pool in self.device.process_cleanup(completed) {
+            if let Some((_, free)) = self
+                .descriptor_pools
+                .iter_mut()
+                .find(|(pool, _)| *pool == freed_pool)
+            {
+                *free = (*free + 1).min(DESCRIPTOR_POOL_SIZE);
+            }
+        }
+        let mut kept_empty = false;
+        self.descriptor_pools.retain(|&(pool, free)| {
+            if free == DESCRIPTOR_POOL_SIZE {
+                if !kept_empty {
+                    kept_empty = true;
+                    true
+                } else {
+                    unsafe { self.device.raw.destroy_descriptor_pool(pool, None) };
+                    false
+                }
+            } else {
+                true
+            }
+        });
         self.dmabuf_textures.retain(|(weak, _)| !weak.is_gone());
         self.render_buffers.retain(|(weak, _)| !weak.is_gone());
     }
@@ -1224,7 +1271,7 @@ impl VulkanRenderer {
                 .descriptor_count(DESCRIPTOR_POOL_SIZE),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
-                .descriptor_count(64),
+                .descriptor_count(DESCRIPTOR_POOL_SIZE),
         ];
         let create_info = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
