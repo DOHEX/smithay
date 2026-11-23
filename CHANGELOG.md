@@ -4,6 +4,23 @@
 
 ### Breaking changes
 
+`XdgDecorationHandler::decoration_destroyed` is a new mandatory callback, 
+compositors must handle it in order to correctly detect that a toplevels withdrew its previous SSD support declaration.
+
+`wayland::virtual_keyboard` no longer sends key events to focused clients on its
+own. A virtual keyboard is now an regular input device:
+`VirtualKeyboardManagerState::new` requires the state to implement the new
+`VirtualKeyboardHandler`, which receives `InputEvent<VirtualKeyboardBackend>`s
+for the compositor to handle like real devices (so special keys, compositor
+bindings, idle handling and focus works properly). The compositor has to
+activate the device's keymap (`VirtualKeyboardDevice::keymap`) before processing
+its key events. Modifiers set with the `modifiers` request are not reset when
+the device is destroyed (the masks are absolute, so that would also clear state
+not set by the device, like locks set by other devices on a shared keymap). The
+compositor is responsible for reconciling the modifier state on `DeviceRemoved`
+(e.g., by tracking the bits set by it). `VirtualKeyboardUserData` is no longer
+generic over the state type.
+
 `crate::wayland::selection::data_device::start_dnd` was removed in favor of exposing the
 underlying `DnDGrab` and associated types to make it possible to write external Drag&Drop sources
 and targets (e.g. for other shell implementations). See the `Additions`-section for more info.
@@ -123,15 +140,64 @@ with the correct lock instance.
 `backend::input` and `input` now use `backend::input::InputTime` for timestamps instead of `u32` or `u64`. `InputTime::now()`
 is used for timestamps for synthesized events.
 
+`TextInputActivation` must be implemented. It allows for hooks to be run when a text input is `activated` and `deactivated`.
+
+`KeyboardHandle::input_intercept()` now has a `source` argument and early-returns `None` when the key was already pressed/released, matching the behavior of `KeyboardHandle::input()`.
+
+```diff
+-let (res, mods_changed) = keyboard.input_intercept(data, keycode, state, filter);
++let Some((res, mods_changed)) = keyboard.input_intercept(
++    KeyboardSource::MAIN,
++    data,
++    keycode,
++    state,
++    filter,
++) else {
++    return;
++};
+```
+
+Input handles now use a separate mutex for grabs, so the inner mutex isn't held during execution of the grab
+(this prevents, for instance, a deadlock if the grab tries to use a mutex internally that another thread holds
+while using input handle methods that don't affect the grab.) As a result there are a few API changes:
+- `KeyboardInnerHandle::current_focus` now returns a clone of the focus instead of a reference
+- `KeyboardInnerHandle::keysym_handle` is removed in favor of an `::xkb()` that clones the `Xkb` instance, and
+   a `KeysymHandle::new` method
+- `PointerInnerHandle::current_pressed` now returns `Vec<u32>` instead of `&[u32]`
+- `TabletToolInnerHandle::current_pressed` now returns `Vec<u32>` instead of `&[u32]`
+
 ### Additions
+
+- `TouchHandle::last_down` gives the serial of the last `wl_touch.down` sent to
+  a client, similar to `PointerHandle::last_enter`, so that compositors can
+  accept xdg-activation tokens created after a tap. anvil now does.
+
+- `XWayland::spawn_with_inherited_env` starts `Xwayland` with the compositor's
+  whole environment, instead of only `PATH` and
+  `XDG_RUNTIME_DIR`. This lets `Xwayland` find GPU drivers installed outside
+  the default paths, for example through `LD_LIBRARY_PATH`.
 
 - Add `WmWindowProperty::Other` to forward unrecognized X11 property changes to the compositor.
 
-- The xdg-decoration global is now advertised at version 2, which allows clients to create a
-  toplevel decoration object after the toplevel already has a buffer attached or committed.
-  `XdgDecorationHandler` gained an optional `decoration_destroyed` method notifying the
-  compositor that the client destroyed the decoration object, so it can switch the surface
-  back to client-side decorations on the next commit as the protocol requires.
+
+- The wlr virtual pointer protocol is now available in `smithay::wayland::virtual_pointer`.
+
+- `Xkb::keymap_as_string` returns the active keymap as `XKB_KEYMAP_FORMAT_TEXT_V1`.
+
+- `XkbContext::set_modifier_mask` applies raw xkb modifier masks to a keyboard
+  for clients that report modifier state directly instead of through key presses
+  (e.g., `zwp_virtual_keyboard_v1.modifiers`).
+
+- `KeyboardHandle::input_forward_bypassing_grab` sends a key skipping the active
+  grab, which can be used by compositors to prevent infinite loops when a client
+  with a grab forwards a key through its own virtual keyboard, which can be
+  tracked with `InputMethodHandle::keyboard_grab_client` and
+  `VirtualKeyboardDevice::client`.
+
+- `VirtualKeyboardDevice::source` gives each virtual keyboard its own
+  `KeyboardSource` so keys pressed on multiple devices are released when the
+  last one is released.
+
 - ExtBackgroundEffect protocol is now available in `smithay::wayland::background_effect` module.
 - `DrmSurface::use_color_state` (and the corresponding `DrmCompositor::use_color_state`) allows
   staging connector color state — `Colorspace`, `HDR_OUTPUT_METADATA` and `max bpc` — which is
@@ -252,6 +318,8 @@ default implementations, which result in skipping the new functionality. As such
 
 `Output` now has `owns_xdg_output()` which allows you to match an XDG output protocol object with an `Output`.
 
+`Output::create_global_with_filter` creates a `wl_output` global visible only to the clients the filter accepts.
+
 Added `Renderer::invalidate_caches`, which unconditionally drops all renderer-internal caches,
 including entries `Renderer::cleanup_texture_cache` retains while their source buffers are still
 alive.
@@ -262,6 +330,30 @@ additionally drops the buffers cached for copying between a render and a target 
 `Renderer` owns.
 
 ### Bugfixes
+
+`LibinputInputBackend` now processes events libinput has queued without making its file descriptor
+readable: the `DeviceAdded` events for devices already present after `Libinput::udev_assign_seat` and
+`Libinput::resume`, and `DeviceRemoved` after `Libinput::suspend`. Previously these waited for the next
+unrelated input event, so a compositor learned about its input devices only at the first key press or
+pointer motion, and applied per-device setup such as keyboard LEDs or libinput configuration only then.
+
+`ForeignToplevelListState::remove_toplevel` no longer removes a different toplevel from the list when
+a handle in front of it was dropped without being removed (the lazy cleanup that the documentation
+allows). Previously the removed entry was picked by its position among the live handles, so a live
+toplevel could be dropped from the list and was then not announced to clients binding the global later.
+
+`input_method_v2`: a second input method binding a seat that already has one is now the object told
+it is `unavailable`, per the protocol, leaving the existing instance in place. Previously the event
+went to the existing instance and the newcomer was dropped untracked. Destroying such an inert
+newcomer no longer clears the active instance, and its requests no longer drive the seat.
+
+`DrmSurface::use_vrr(false)` now succeeds as a no-op when using legacy DRM. Attempts to enable VRR
+on legacy DRM still return `UnknownProperty`.
+
+The `xdg_toplevel` request handler now posts an `invalid_size` error when a client performs a `set_max_size` or `set_min_size` request with a negative width or height.
+
+`DrmDeviceFd::new` no longer tries to become DRM master on a render node, which the kernel always
+refuses, so it no longer warns about it.
 
 `SimpleCrtcMapper` (in `smithay-drm-extras`) now releases the CRTC reservation of any connector that
 is no longer connected, including connectors that have disappeared from the resource list entirely
@@ -291,6 +383,10 @@ callbacks to surfaces whose renderer state has no buffer, or to their subsurface
 `GlesRenderer::cleanup_texture_cache` and `GlesRenderer::invalidate_caches` now only make their EGL
 context current when resources are queued for destruction. This avoids waking idle GPUs and
 blocking the compositor while they resume.
+
+`ext_image_copy_capture_session_v1` now raises the `duplicate_frame` protocol error when a client
+calls `create_frame` while the session still has an active frame, as the protocol requires. Previously
+the request was accepted and the extra frame was silently added to the session.
 
 ## 0.7.0
 

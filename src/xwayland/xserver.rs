@@ -1,7 +1,7 @@
 use std::{
     env,
     ffi::OsStr,
-    os::fd::{BorrowedFd, OwnedFd},
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
     os::unix::{
         io::{AsRawFd, RawFd},
         net::UnixStream,
@@ -89,6 +89,10 @@ impl XWayland {
     /// Spawns an XWayland server instance. `Xwayland` must be on the `PATH` and
     /// executable.
     ///
+    /// `Xwayland` starts with only `PATH` and `XDG_RUNTIME_DIR` from the
+    /// compositor's environment, plus `envs`. To pass the whole environment
+    /// instead, use [`spawn_with_inherited_env`](Self::spawn_with_inherited_env).
+    ///
     /// ## Arguments
     ///
     /// - `display` - if provided, only the given display number will be tested.
@@ -130,6 +134,83 @@ impl XWayland {
         A: AsRef<OsStr>,
         F: FnOnce(&UserDataMap),
     {
+        Self::spawn_inner(
+            dh,
+            display,
+            envs,
+            extra_args,
+            open_abstract_socket,
+            stdout,
+            stderr,
+            user_data,
+            true,
+        )
+    }
+
+    /// Spawns an `Xwayland` server instance that inherits the compositor's
+    /// whole environment. `Xwayland` must be on the `PATH` and executable.
+    /// Use it when `Xwayland` needs variables that [`spawn`](Self::spawn) drops.
+    ///
+    /// `WAYLAND_SOCKET` is always replaced, and `envs` is applied last, so it
+    /// can override inherited variables. The arguments and return value are
+    /// the same as for [`spawn`](Self::spawn).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the X11 sockets cannot be set up, `Xwayland` cannot
+    /// be started, or its client cannot be added to the display.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_inherited_env<K, V, I, A, AI, F>(
+        dh: &DisplayHandle,
+        display: impl Into<Option<u32>>,
+        envs: I,
+        extra_args: AI,
+        open_abstract_socket: bool,
+        stdout: impl Into<std::process::Stdio>,
+        stderr: impl Into<std::process::Stdio>,
+        user_data: F,
+    ) -> std::io::Result<(Self, Client)>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+        AI: IntoIterator<Item = A>,
+        A: AsRef<OsStr>,
+        F: FnOnce(&UserDataMap),
+    {
+        Self::spawn_inner(
+            dh,
+            display,
+            envs,
+            extra_args,
+            open_abstract_socket,
+            stdout,
+            stderr,
+            user_data,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_inner<K, V, I, A, AI, F>(
+        dh: &DisplayHandle,
+        display: impl Into<Option<u32>>,
+        envs: I,
+        extra_args: AI,
+        open_abstract_socket: bool,
+        stdout: impl Into<std::process::Stdio>,
+        stderr: impl Into<std::process::Stdio>,
+        user_data: F,
+        clear_env: bool,
+    ) -> std::io::Result<(Self, Client)>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+        AI: IntoIterator<Item = A>,
+        A: AsRef<OsStr>,
+        F: FnOnce(&UserDataMap),
+    {
         let (x_wm_x11, x_wm_me) = UnixStream::pair()?;
         let (wl_x11, wl_me) = UnixStream::pair()?;
 
@@ -162,12 +243,13 @@ impl XWayland {
             command.arg(arg);
         }
 
-        // Setup the environment; clear everything except PATH and XDG_RUNTIME_DIR.
-        command.env_clear();
-        for (key, value) in env::vars_os() {
-            if key.to_str() == Some("PATH") || key.to_str() == Some("XDG_RUNTIME_DIR") {
-                command.env(key, value);
-                continue;
+        if clear_env {
+            // Setup the environment; clear everything except PATH and XDG_RUNTIME_DIR.
+            command.env_clear();
+            for (key, value) in env::vars_os() {
+                if key.to_str() == Some("PATH") || key.to_str() == Some("XDG_RUNTIME_DIR") {
+                    command.env(key, value);
+                }
             }
         }
 
@@ -197,6 +279,12 @@ impl XWayland {
         info!("spawning XWayland instance");
 
         let child = command.spawn()?;
+        let pidfd = rustix::process::pidfd_open(
+            rustix::process::Pid::from_child(&child),
+            rustix::process::PidfdFlags::empty(),
+        )
+        .map_err(|err| tracing::warn!(?err, "Failed to open a pidfd for Xwayland"))
+        .ok();
 
         // SAFETY: RawFd's AsRawFd impl is infallible.
         let wrapper = unsafe { calloop::generic::FdWrapper::new(displayfd_recv.as_raw_fd()) };
@@ -222,6 +310,7 @@ impl XWayland {
                 compositor_state: CompositorClientState::default(),
                 data_map,
                 child: Mutex::new(Some(child)),
+                pidfd,
             }),
         )?;
 
@@ -377,6 +466,7 @@ pub struct XWaylandClientData {
     pub compositor_state: CompositorClientState,
     data_map: UserDataMap,
     child: Mutex<Option<Child>>,
+    pidfd: Option<OwnedFd>,
 }
 
 impl ClientData for XWaylandClientData {
@@ -400,6 +490,11 @@ impl XWaylandClientData {
     /// Access user_data map for a xwayland client
     pub fn user_data(&self) -> &UserDataMap {
         &self.data_map
+    }
+
+    /// pidfd of the Xwayland process
+    pub fn pidfd(&self) -> Option<BorrowedFd<'_>> {
+        self.pidfd.as_ref().map(|fd| fd.as_fd())
     }
 }
 
